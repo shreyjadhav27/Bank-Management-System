@@ -1,0 +1,1487 @@
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <ctype.h>
+
+/* ---------------------- Constants ---------------------- */
+#define ADMIN_USER "admin"
+#define ADMIN_PASS "admin123"
+#define ACCOUNTS_FILE "accounts.dat"
+#define TRANSACTIONS_FILE "transactions.dat"
+
+#define NAME_LEN 50
+#define PHONE_LEN 11 /* 10 digits + '\0' */
+#define ADDR_LEN 80
+#define TYPE_LEN 10
+#define PIN_LEN 5 /* 4 digits + '\0' */
+#define TX_TYPE_LEN 20
+#define TIME_LEN 20
+#define SERVICE_LEN 30
+#define INPUT_LEN 100
+
+#define FIRST_ACC_NO 1001
+#define MAX_ACC_NO 999999
+#define MIN_INITIAL_DEPOSIT 500.0
+#define MAX_AMOUNT 1000000000.0
+#define MAX_LOGIN_ATTEMPTS 3
+
+#define TYPE_SAVINGS "Savings"
+#define TYPE_CURRENT "Current"
+
+#define SORT_BY_ACCNO 1
+#define SORT_BY_NAME 2
+#define SORT_BY_BALANCE 3
+
+/* ---------------------- Structures ---------------------- */
+
+/* One bank account (customer information) */
+typedef struct {
+    int accNo;
+    char name[NAME_LEN];
+    char phone[PHONE_LEN];
+    char address[ADDR_LEN];
+    char type[TYPE_LEN]; /* "Savings" or "Current" */
+    double balance;
+    char pin[PIN_LEN];   /* 4-digit PIN stored as text */
+    int status;          /* 1 = Active, 0 = Blocked */
+} Account;
+
+/* LINKED LIST NODE: account data + pointer to next account */
+typedef struct AccountNode {
+    Account data;
+    struct AccountNode *next;
+} AccountNode;
+
+/* One transaction record */
+typedef struct {
+    int id;
+    int accNo;
+    char type[TX_TYPE_LEN]; /* Deposit, Withdrawal, Transfer Out, ... */
+    double amount;
+    char dateTime[TIME_LEN];
+    double balanceAfter;
+    int otherAcc; /* other account in a transfer, 0 if none */
+} Transaction;
+
+/* STACK NODE: transaction + pointer to the node below it */
+typedef struct TxNode {
+    Transaction data;
+    struct TxNode *next;
+} TxNode;
+
+/* STACK: 'top' always points to the newest transaction (LIFO) */
+typedef struct {
+    TxNode *top;
+    int count;
+    int nextId;
+} TxStack;
+
+/* QUEUE NODE: a customer waiting for service */
+typedef struct QueueNode {
+    int token;
+    char name[NAME_LEN];
+    char service[SERVICE_LEN];
+    struct QueueNode *next;
+} QueueNode;
+
+/* QUEUE: remove from 'front', add at 'rear' (FIFO) */
+typedef struct {
+    QueueNode *front;
+    QueueNode *rear;
+    int size;
+    int nextToken;
+} Queue;
+
+/* Whole bank state, passed to functions (avoids global variables) */
+typedef struct {
+    AccountNode *head; /* head of the accounts linked list */
+    TxStack txStack;
+    Queue queue;
+    int nextAccNo;
+} Bank;
+
+/* ====================================================== */
+/*                    INPUT HELPERS                        */
+/* ====================================================== */
+
+/* Remove leading and trailing spaces from a string */
+static void trimString(char *s)
+{
+    size_t start = 0, len;
+    while (s[start] != '\0' && isspace((unsigned char)s[start])) {
+        start++;
+    }
+    if (start > 0) {
+        memmove(s, s + start, strlen(s + start) + 1);
+    }
+    len = strlen(s);
+    while (len > 0 && isspace((unsigned char)s[len - 1])) {
+        s[--len] = '\0';
+    }
+}
+
+/* Safely read one line of text (never overflows the buffer).
+ * If input ends (Ctrl+D / Ctrl+Z) the program exits; all data is
+ * already saved after every operation, so nothing is lost. */
+static void readLine(const char *prompt, char *buf, int size)
+{
+    size_t len;
+    printf("%s", prompt);
+    if (fgets(buf, size, stdin) == NULL) {
+        printf("\nInput closed. Exiting program.\n");
+        exit(0);
+    }
+    len = strlen(buf);
+    if (len > 0 && buf[len - 1] == '\n') {
+        buf[len - 1] = '\0';
+    } else {
+        int ch; /* line was too long: throw away the rest of it */
+        while ((ch = getchar()) != '\n' && ch != EOF) {
+        }
+    }
+    trimString(buf);
+}
+
+/* Read an integer between min and max (keeps asking until valid) */
+static int readInt(const char *prompt, int min, int max)
+{
+    char buf[INPUT_LEN];
+    char *end;
+    long value;
+    while (1) {
+        readLine(prompt, buf, sizeof buf);
+        value = strtol(buf, &end, 10);
+        if (buf[0] != '\0' && *end == '\0' && value >= min && value <= max) {
+            return (int)value;
+        }
+        printf("Invalid input. Please enter a number between %d and %d.\n", min, max);
+    }
+}
+
+/* Returns 1 if text is a positive-looking amount: digits, optional '.',
+ * at most 2 decimal places. Rejects "-5", "abc", "1e5", "nan" etc. */
+static int isValidAmountText(const char *s)
+{
+    int dots = 0, digits = 0, decimals = 0;
+    if (*s == '\0') {
+        return 0;
+    }
+    for (; *s != '\0'; s++) {
+        if (*s == '.') {
+            if (++dots > 1) {
+                return 0;
+            }
+        } else if (isdigit((unsigned char)*s)) {
+            digits++;
+            if (dots) {
+                decimals++;
+            }
+        } else {
+            return 0;
+        }
+    }
+    return digits > 0 && decimals <= 2;
+}
+
+/* Read a money amount greater than zero */
+static double readAmount(const char *prompt)
+{
+    char buf[INPUT_LEN];
+    double value;
+    while (1) {
+        readLine(prompt, buf, sizeof buf);
+        if (isValidAmountText(buf)) {
+            value = strtod(buf, NULL);
+            if (value > 0.0 && value <= MAX_AMOUNT) {
+                return value;
+            }
+        }
+        printf("Invalid amount. Enter a positive number (max 2 decimals, below %.0f).\n", MAX_AMOUNT);
+    }
+}
+
+/* Returns 1 if every character of s is a digit */
+static int isAllDigits(const char *s)
+{
+    if (*s == '\0') {
+        return 0;
+    }
+    for (; *s != '\0'; s++) {
+        if (!isdigit((unsigned char)*s)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Read a 10-digit phone number */
+static void readPhone(char *phone)
+{
+    char buf[INPUT_LEN];
+    while (1) {
+        readLine("Phone number (10 digits): ", buf, sizeof buf);
+        if (strlen(buf) == 10 && isAllDigits(buf)) {
+            strcpy(phone, buf); /* length already checked */
+            return;
+        }
+        printf("Invalid phone number. It must contain exactly 10 digits.\n");
+    }
+}
+
+/* Read a 4-digit PIN */
+static void readPin(const char *prompt, char *pin)
+{
+    char buf[INPUT_LEN];
+    while (1) {
+        readLine(prompt, buf, sizeof buf);
+        if (strlen(buf) == 4 && isAllDigits(buf)) {
+            strcpy(pin, buf); /* length already checked */
+            return;
+        }
+        printf("Invalid PIN. It must be exactly 4 digits.\n");
+    }
+}
+
+/* Read a name (letters and spaces only) */
+static void readName(const char *prompt, char *name)
+{
+    char buf[INPUT_LEN];
+    size_t i;
+    int ok;
+    while (1) {
+        readLine(prompt, buf, sizeof buf);
+        ok = (buf[0] != '\0' && strlen(buf) < NAME_LEN);
+        for (i = 0; ok && buf[i] != '\0'; i++) {
+            if (!isalpha((unsigned char)buf[i]) && buf[i] != ' ') {
+                ok = 0;
+            }
+        }
+        if (ok) {
+            strcpy(name, buf); /* length already checked */
+            return;
+        }
+        printf("Invalid name. Use letters and spaces only (max %d characters).\n", NAME_LEN - 1);
+    }
+}
+
+/* Read a non-empty address */
+static void readAddress(char *address)
+{
+    char buf[INPUT_LEN];
+    while (1) {
+        readLine("Address: ", buf, sizeof buf);
+        if (buf[0] != '\0' && strlen(buf) < ADDR_LEN) {
+            strcpy(address, buf); /* length already checked */
+            return;
+        }
+        printf("Invalid address. It cannot be empty (max %d characters).\n", ADDR_LEN - 1);
+    }
+}
+
+/* Ask a yes/no question; returns 1 for yes, 0 for no */
+static int readYesNo(const char *prompt)
+{
+    char buf[INPUT_LEN];
+    while (1) {
+        readLine(prompt, buf, sizeof buf);
+        if (buf[0] == 'y' || buf[0] == 'Y') {
+            return 1;
+        }
+        if (buf[0] == 'n' || buf[0] == 'N') {
+            return 0;
+        }
+        printf("Please type y or n.\n");
+    }
+}
+
+/* Get current date and time as text: YYYY-MM-DD HH:MM:SS */
+static void getCurrentTime(char *out, size_t size)
+{
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    if (t != NULL) {
+        strftime(out, size, "%Y-%m-%d %H:%M:%S", t);
+    } else {
+        snprintf(out, size, "unknown");
+    }
+}
+
+/* ====================================================== */
+/*          LINKED LIST OPERATIONS (ACCOUNTS)              */
+/* ====================================================== */
+
+/* SEARCH in linked list by account number: walk node by node. O(n) */
+static AccountNode *findAccount(AccountNode *head, int accNo)
+{
+    AccountNode *cur = head;
+    while (cur != NULL) {
+        if (cur->data.accNo == accNo) {
+            return cur;
+        }
+        cur = cur->next;
+    }
+    return NULL;
+}
+
+/* INSERT a new account at the END of the linked list. O(n)
+ * Returns the new node, or NULL if the account number already exists
+ * (prevents duplicates) or memory is not available. */
+static AccountNode *insertAccount(Bank *bank, const Account *acc)
+{
+    AccountNode *node, *cur;
+
+    if (findAccount(bank->head, acc->accNo) != NULL) {
+        return NULL; /* duplicate account number */
+    }
+    node = (AccountNode *)malloc(sizeof(AccountNode));
+    if (node == NULL) {
+        printf("Error: out of memory.\n");
+        return NULL;
+    }
+    node->data = *acc;
+    node->next = NULL;
+
+    if (bank->head == NULL) {
+        bank->head = node; /* first node */
+    } else {
+        cur = bank->head;
+        while (cur->next != NULL) {
+            cur = cur->next;
+        }
+        cur->next = node; /* attach at the end */
+    }
+    return node;
+}
+
+/* DELETE the node with the given account number. O(n)
+ * 'prev' remembers the node before 'cur' so we can skip over 'cur'. */
+static int deleteAccountNode(Bank *bank, int accNo)
+{
+    AccountNode *cur = bank->head;
+    AccountNode *prev = NULL;
+
+    while (cur != NULL && cur->data.accNo != accNo) {
+        prev = cur;
+        cur = cur->next;
+    }
+    if (cur == NULL) {
+        return 0; /* not found */
+    }
+    if (prev == NULL) {
+        bank->head = cur->next; /* deleting the first node */
+    } else {
+        prev->next = cur->next;
+    }
+    free(cur);
+    return 1;
+}
+
+static void printAccountHeader(void)
+{
+    printf("%-8s %-20s %-12s %-9s %14s %-8s\n",
+           "Acc No", "Name", "Phone", "Type", "Balance", "Status");
+    printf("----------------------------------------------------------------------------\n");
+}
+
+static void printAccountRow(const Account *a)
+{
+    printf("%-8d %-20.20s %-12s %-9s %14.2f %-8s\n",
+           a->accNo, a->name, a->phone, a->type, a->balance,
+           a->status ? "Active" : "Blocked");
+}
+
+/* DISPLAY all accounts by traversing the linked list from head. O(n) */
+static void displayAccounts(const Bank *bank)
+{
+    const AccountNode *cur = bank->head;
+    int count = 0;
+
+    if (cur == NULL) {
+        printf("No accounts found.\n");
+        return;
+    }
+    printAccountHeader();
+    while (cur != NULL) {
+        printAccountRow(&cur->data);
+        count++;
+        cur = cur->next;
+    }
+    printf("Total accounts: %d\n", count);
+}
+
+/* Show full details of one account (PIN is never displayed) */
+static void displayAccountDetails(const Account *a)
+{
+    printf("\n----------- ACCOUNT DETAILS -----------\n");
+    printf("Account number : %d\n", a->accNo);
+    printf("Customer name  : %s\n", a->name);
+    printf("Phone number   : %s\n", a->phone);
+    printf("Address        : %s\n", a->address);
+    printf("Account type   : %s\n", a->type);
+    printf("Balance        : Rs %.2f\n", a->balance);
+    printf("Status         : %s\n", a->status ? "Active" : "Blocked");
+}
+
+/* Free every node of the accounts list */
+static void freeAccounts(Bank *bank)
+{
+    AccountNode *cur = bank->head;
+    AccountNode *nextNode;
+    while (cur != NULL) {
+        nextNode = cur->next;
+        free(cur);
+        cur = nextNode;
+    }
+    bank->head = NULL;
+}
+
+/* ====================================================== */
+/*               STACK OPERATIONS (TRANSACTIONS)           */
+/* ====================================================== */
+
+/* PUSH an existing transaction record onto the stack. O(1)
+ * The new node becomes the top. */
+static int pushTransactionRecord(TxStack *s, const Transaction *t)
+{
+    TxNode *node = (TxNode *)malloc(sizeof(TxNode));
+    if (node == NULL) {
+        printf("Error: out of memory.\n");
+        return 0;
+    }
+    node->data = *t;
+    node->next = s->top;
+    s->top = node;
+    s->count++;
+    return 1;
+}
+
+/* Build a new transaction (with ID and time) and PUSH it. O(1) */
+static int pushTransaction(TxStack *s, int accNo, const char *type,
+                           double amount, double balanceAfter, int otherAcc)
+{
+    Transaction t;
+    memset(&t, 0, sizeof t);
+    t.id = s->nextId++;
+    t.accNo = accNo;
+    snprintf(t.type, sizeof t.type, "%s", type);
+    t.amount = amount;
+    getCurrentTime(t.dateTime, sizeof t.dateTime);
+    t.balanceAfter = balanceAfter;
+    t.otherAcc = otherAcc;
+    return pushTransactionRecord(s, &t);
+}
+
+/* POP the newest transaction (LIFO). O(1)
+ * Returns 1 and copies the record into *out, or 0 if the stack is empty. */
+static int popTransaction(TxStack *s, Transaction *out)
+{
+    TxNode *node;
+    if (s->top == NULL) {
+        return 0;
+    }
+    node = s->top;
+    *out = node->data;
+    s->top = node->next;
+    s->count--;
+    free(node);
+    return 1;
+}
+
+/* Display transactions from the top of the stack (newest first).
+ * accNo = 0 shows every account; limit = 0 shows all matching records. */
+static void displayTransactions(const TxStack *s, int accNo, int limit)
+{
+    const TxNode *cur = s->top;
+    int shown = 0;
+    char other[12];
+
+    printf("%-6s %-8s %-17s %12s %-19s %12s %-8s\n",
+           "ID", "Account", "Type", "Amount", "Date & Time", "Balance", "Other A/c");
+    printf("----------------------------------------------------------------------------------------\n");
+    while (cur != NULL) {
+        if (accNo == 0 || cur->data.accNo == accNo) {
+            if (cur->data.otherAcc > 0) {
+                snprintf(other, sizeof other, "%d", cur->data.otherAcc);
+            } else {
+                snprintf(other, sizeof other, "-");
+            }
+            printf("%-6d %-8d %-17s %12.2f %-19s %12.2f %-8s\n",
+                   cur->data.id, cur->data.accNo, cur->data.type,
+                   cur->data.amount, cur->data.dateTime,
+                   cur->data.balanceAfter, other);
+            shown++;
+            if (limit > 0 && shown >= limit) {
+                break;
+            }
+        }
+        cur = cur->next;
+    }
+    if (shown == 0) {
+        printf("No transactions found.\n");
+    }
+}
+
+/* Free every node of the stack */
+static void freeStack(TxStack *s)
+{
+    TxNode *cur = s->top;
+    TxNode *nextNode;
+    while (cur != NULL) {
+        nextNode = cur->next;
+        free(cur);
+        cur = nextNode;
+    }
+    s->top = NULL;
+    s->count = 0;
+}
+
+/* ====================================================== */
+/*               QUEUE OPERATIONS (WAITING CUSTOMERS)      */
+/* ====================================================== */
+
+/* ENQUEUE: add a customer at the REAR of the queue. O(1) */
+static int addToQueue(Queue *q, const char *name, const char *service)
+{
+    QueueNode *node = (QueueNode *)malloc(sizeof(QueueNode));
+    if (node == NULL) {
+        printf("Error: out of memory.\n");
+        return 0;
+    }
+    node->token = q->nextToken++;
+    snprintf(node->name, sizeof node->name, "%s", name);
+    snprintf(node->service, sizeof node->service, "%s", service);
+    node->next = NULL;
+
+    if (q->rear == NULL) {
+        q->front = node; /* queue was empty */
+        q->rear = node;
+    } else {
+        q->rear->next = node;
+        q->rear = node;
+    }
+    q->size++;
+    printf("Customer added to queue. Token number: %d\n", node->token);
+    return 1;
+}
+
+/* DEQUEUE: serve the customer at the FRONT (first come, first served). O(1) */
+static int serveQueue(Queue *q)
+{
+    QueueNode *node;
+    if (q->front == NULL) {
+        printf("The waiting queue is empty. No customer to serve.\n");
+        return 0;
+    }
+    node = q->front;
+    printf("Now serving -> Token %d | %s | Service: %s\n",
+           node->token, node->name, node->service);
+    q->front = node->next;
+    if (q->front == NULL) {
+        q->rear = NULL; /* queue became empty */
+    }
+    q->size--;
+    free(node);
+    return 1;
+}
+
+/* Display the waiting queue from front to rear */
+static void displayQueue(const Queue *q)
+{
+    const QueueNode *cur = q->front;
+    if (cur == NULL) {
+        printf("The waiting queue is empty.\n");
+        return;
+    }
+    printf("%-8s %-25s %-25s\n", "Token", "Customer name", "Service");
+    printf("------------------------------------------------------------\n");
+    while (cur != NULL) {
+        printf("%-8d %-25.25s %-25.25s\n", cur->token, cur->name, cur->service);
+        cur = cur->next;
+    }
+    printf("Customers waiting: %d\n", q->size);
+}
+
+/* Free every node of the queue */
+static void freeQueue(Queue *q)
+{
+    QueueNode *cur = q->front;
+    QueueNode *nextNode;
+    while (cur != NULL) {
+        nextNode = cur->next;
+        free(cur);
+        cur = nextNode;
+    }
+    q->front = NULL;
+    q->rear = NULL;
+    q->size = 0;
+}
+
+/* ====================================================== */
+/*                      FILE HANDLING                      */
+/* ====================================================== */
+
+/* Write all accounts (linked list) to accounts.dat. Returns 1 on success. */
+static int saveAccounts(const Bank *bank)
+{
+    FILE *fp = fopen(ACCOUNTS_FILE, "wb");
+    const AccountNode *cur;
+
+    if (fp == NULL) {
+        printf("Error: cannot open %s for writing.\n", ACCOUNTS_FILE);
+        return 0;
+    }
+    for (cur = bank->head; cur != NULL; cur = cur->next) {
+        if (fwrite(&cur->data, sizeof(Account), 1, fp) != 1) {
+            printf("Error: failed while writing %s.\n", ACCOUNTS_FILE);
+            fclose(fp);
+            return 0;
+        }
+    }
+    fclose(fp);
+    return 1;
+}
+
+/* Read accounts.dat at startup and rebuild the linked list. */
+static int loadAccounts(Bank *bank)
+{
+    FILE *fp = fopen(ACCOUNTS_FILE, "rb");
+    Account acc;
+    int maxAccNo = FIRST_ACC_NO - 1;
+
+    if (fp == NULL) {
+        printf("No %s found. Starting with no accounts (first run).\n", ACCOUNTS_FILE);
+        return 0;
+    }
+    while (fread(&acc, sizeof(Account), 1, fp) == 1) {
+        /* make sure text fields are terminated even if the file is damaged */
+        acc.name[NAME_LEN - 1] = '\0';
+        acc.phone[PHONE_LEN - 1] = '\0';
+        acc.address[ADDR_LEN - 1] = '\0';
+        acc.type[TYPE_LEN - 1] = '\0';
+        acc.pin[PIN_LEN - 1] = '\0';
+        if (insertAccount(bank, &acc) != NULL && acc.accNo > maxAccNo) {
+            maxAccNo = acc.accNo;
+        }
+    }
+    fclose(fp);
+    bank->nextAccNo = maxAccNo + 1;
+    return 1;
+}
+
+/* Write the whole transaction stack to transactions.dat.
+ * The file stores OLDEST first, so we copy the stack into an array
+ * from the back (top = newest goes to the last position). */
+static int saveTransactions(const TxStack *s)
+{
+    FILE *fp;
+    Transaction *arr = NULL;
+    const TxNode *cur;
+    int i, ok = 1;
+
+    if (s->count > 0) {
+        arr = (Transaction *)malloc((size_t)s->count * sizeof(Transaction));
+        if (arr == NULL) {
+            printf("Error: out of memory while saving transactions.\n");
+            return 0;
+        }
+        i = s->count - 1;
+        for (cur = s->top; cur != NULL && i >= 0; cur = cur->next) {
+            arr[i--] = cur->data;
+        }
+    }
+    fp = fopen(TRANSACTIONS_FILE, "wb");
+    if (fp == NULL) {
+        printf("Error: cannot open %s for writing.\n", TRANSACTIONS_FILE);
+        free(arr);
+        return 0;
+    }
+    if (s->count > 0 && fwrite(arr, sizeof(Transaction), (size_t)s->count, fp) != (size_t)s->count) {
+        printf("Error: failed while writing %s.\n", TRANSACTIONS_FILE);
+        ok = 0;
+    }
+    fclose(fp);
+    free(arr);
+    return ok;
+}
+
+/* Read transactions.dat and push each record (oldest first),
+ * so the newest transaction ends up on top of the stack. */
+static int loadTransactions(TxStack *s)
+{
+    FILE *fp = fopen(TRANSACTIONS_FILE, "rb");
+    Transaction t;
+    int maxId = 0;
+
+    if (fp == NULL) {
+        printf("No %s found. Starting with empty history (first run).\n", TRANSACTIONS_FILE);
+        return 0;
+    }
+    while (fread(&t, sizeof(Transaction), 1, fp) == 1) {
+        t.type[TX_TYPE_LEN - 1] = '\0';
+        t.dateTime[TIME_LEN - 1] = '\0';
+        if (pushTransactionRecord(s, &t) && t.id > maxId) {
+            maxId = t.id;
+        }
+    }
+    fclose(fp);
+    s->nextId = maxId + 1;
+    return 1;
+}
+
+/* Save both files (called after every change so no data is lost) */
+static void saveAll(const Bank *bank)
+{
+    saveAccounts(bank);
+    saveTransactions(&bank->txStack);
+}
+
+/* ====================================================== */
+/*                SEARCHING AND SORTING                    */
+/* ====================================================== */
+
+/* Case-insensitive string comparison (like strcmp) */
+static int compareIgnoreCase(const char *a, const char *b)
+{
+    while (*a != '\0' && *b != '\0') {
+        int ca = tolower((unsigned char)*a);
+        int cb = tolower((unsigned char)*b);
+        if (ca != cb) {
+            return ca - cb;
+        }
+        a++;
+        b++;
+    }
+    return tolower((unsigned char)*a) - tolower((unsigned char)*b);
+}
+
+/* Returns 1 if 'pattern' appears inside 'text' (ignoring case) */
+static int containsIgnoreCase(const char *text, const char *pattern)
+{
+    size_t n = strlen(text), m = strlen(pattern), i, j;
+    if (m == 0) {
+        return 1;
+    }
+    for (i = 0; i + m <= n; i++) {
+        j = 0;
+        while (j < m && tolower((unsigned char)text[i + j]) == tolower((unsigned char)pattern[j])) {
+            j++;
+        }
+        if (j == m) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Compare two accounts by the chosen key. Negative: a < b, 0: equal, positive: a > b */
+static int compareAccounts(const Account *a, const Account *b, int key)
+{
+    if (key == SORT_BY_ACCNO) {
+        return a->accNo - b->accNo;
+    }
+    if (key == SORT_BY_NAME) {
+        return compareIgnoreCase(a->name, b->name);
+    }
+    if (a->balance < b->balance) {
+        return -1;
+    }
+    if (a->balance > b->balance) {
+        return 1;
+    }
+    return 0;
+}
+
+/* Copy the addresses of all list nodes into an array of pointers.
+ * Arrays allow direct access by index, which binary search and
+ * sorting need. Caller must free() the returned array. */
+static AccountNode **buildAccountArray(const Bank *bank, int *count)
+{
+    AccountNode *cur;
+    AccountNode **arr;
+    int n = 0, i = 0;
+
+    for (cur = bank->head; cur != NULL; cur = cur->next) {
+        n++;
+    }
+    *count = n;
+    if (n == 0) {
+        return NULL;
+    }
+    arr = (AccountNode **)malloc((size_t)n * sizeof(AccountNode *));
+    if (arr == NULL) {
+        printf("Error: out of memory.\n");
+        *count = 0;
+        return NULL;
+    }
+    for (cur = bank->head; cur != NULL; cur = cur->next) {
+        arr[i++] = cur;
+    }
+    return arr;
+}
+
+/* BUBBLE SORT on an array of node pointers.
+ * Repeatedly compare neighbours and swap them if out of order.
+ * After each pass the largest (or smallest) item "bubbles" to the end.
+ * Time: O(n^2) worst/average, O(n) best (already sorted, thanks to the
+ * 'swapped' flag). Space: O(1) extra. It is a stable sort. */
+static void sortPointerArray(AccountNode **arr, int n, int key, int ascending)
+{
+    int pass, j, swapped, cmp;
+    AccountNode *temp;
+
+    for (pass = 0; pass < n - 1; pass++) {
+        swapped = 0;
+        for (j = 0; j < n - 1 - pass; j++) {
+            cmp = compareAccounts(&arr[j]->data, &arr[j + 1]->data, key);
+            if ((ascending && cmp > 0) || (!ascending && cmp < 0)) {
+                temp = arr[j];
+                arr[j] = arr[j + 1];
+                arr[j + 1] = temp;
+                swapped = 1;
+            }
+        }
+        if (!swapped) {
+            break; /* no swaps in a full pass: already sorted */
+        }
+    }
+}
+
+/* Sort the accounts by key (ascending or descending) and re-link the
+ * linked list in the new order. Returns 1 on success. */
+static int sortAccounts(Bank *bank, int key, int ascending)
+{
+    int n, i;
+    AccountNode **arr = buildAccountArray(bank, &n);
+
+    if (arr == NULL) {
+        return 0; /* no accounts (or no memory) */
+    }
+    sortPointerArray(arr, n, key, ascending);
+
+    /* re-link the list using the sorted order */
+    for (i = 0; i < n - 1; i++) {
+        arr[i]->next = arr[i + 1];
+    }
+    arr[n - 1]->next = NULL;
+    bank->head = arr[0];
+
+    free(arr);
+    return 1;
+}
+
+/* LINEAR SEARCH: check every node one by one for a name match.
+ * Time: O(n). Works on unsorted data. Returns the number of matches. */
+static int linearSearchByName(const Bank *bank, const char *name)
+{
+    const AccountNode *cur;
+    int comparisons = 0, found = 0;
+
+    for (cur = bank->head; cur != NULL; cur = cur->next) {
+        comparisons++;
+        if (containsIgnoreCase(cur->data.name, name)) {
+            if (found == 0) {
+                printAccountHeader();
+            }
+            printAccountRow(&cur->data);
+            found++;
+        }
+    }
+    if (found == 0) {
+        printf("Result: no account found with name containing \"%s\".\n", name);
+    }
+    printf("[Linear search: %d comparison(s), %d match(es)]\n", comparisons, found);
+    return found;
+}
+
+/* BINARY SEARCH: the array MUST be sorted by account number.
+ * Each step halves the search range. Time: O(log n). */
+static AccountNode *binarySearchAccount(AccountNode **arr, int n, int accNo, int *steps)
+{
+    int low = 0, high = n - 1, mid;
+
+    *steps = 0;
+    while (low <= high) {
+        mid = low + (high - low) / 2;
+        (*steps)++;
+        if (arr[mid]->data.accNo == accNo) {
+            return arr[mid];
+        }
+        if (arr[mid]->data.accNo < accNo) {
+            low = mid + 1;  /* search right half */
+        } else {
+            high = mid - 1; /* search left half */
+        }
+    }
+    return NULL;
+}
+
+/* Admin search menu: linear search by name OR binary search by account number */
+static void searchAccount(Bank *bank)
+{
+    int choice, accNo, n, steps;
+    char name[INPUT_LEN];
+    AccountNode **arr;
+    AccountNode *result;
+
+    printf("\n--- Search Account ---\n");
+    printf("1. Linear Search by customer name\n");
+    printf("2. Binary Search by account number\n");
+    printf("3. Back\n");
+    choice = readInt("Enter choice: ", 1, 3);
+
+    if (choice == 1) {
+        readLine("Enter name (or part of a name): ", name, sizeof name);
+        if (name[0] == '\0') {
+            printf("Name cannot be empty.\n");
+            return;
+        }
+        linearSearchByName(bank, name);
+    } else if (choice == 2) {
+        accNo = readInt("Enter account number: ", FIRST_ACC_NO, MAX_ACC_NO);
+        arr = buildAccountArray(bank, &n);
+        if (arr == NULL) {
+            printf("No accounts available to search.\n");
+            return;
+        }
+        /* Binary search needs sorted data, so sort by account number first */
+        sortPointerArray(arr, n, SORT_BY_ACCNO, 1);
+        result = binarySearchAccount(arr, n, accNo, &steps);
+        if (result != NULL) {
+            printf("Account found!\n");
+            printAccountHeader();
+            printAccountRow(&result->data);
+        } else {
+            printf("Result: account %d not found.\n", accNo);
+        }
+        printf("[Binary search on %d sorted account(s): %d step(s)]\n", n, steps);
+        free(arr);
+    }
+}
+
+/* ====================================================== */
+/*                   CUSTOMER OPERATIONS                   */
+/* ====================================================== */
+
+/* Create a new account with a unique, automatically generated number */
+static void createAccount(Bank *bank)
+{
+    Account acc;
+    char pin1[PIN_LEN], pin2[PIN_LEN];
+    int typeChoice;
+    double deposit;
+    AccountNode *node;
+
+    memset(&acc, 0, sizeof acc);
+    printf("\n--- Create New Account ---\n");
+    readName("Customer name: ", acc.name);
+    readPhone(acc.phone);
+    readAddress(acc.address);
+
+    printf("Account type: 1. Savings  2. Current\n");
+    typeChoice = readInt("Enter choice: ", 1, 2);
+    snprintf(acc.type, sizeof acc.type, "%s", typeChoice == 1 ? TYPE_SAVINGS : TYPE_CURRENT);
+
+    while (1) {
+        deposit = readAmount("Initial deposit: ");
+        if (deposit >= MIN_INITIAL_DEPOSIT) {
+            break;
+        }
+        printf("Initial deposit must be at least Rs %.2f.\n", MIN_INITIAL_DEPOSIT);
+    }
+
+    while (1) {
+        readPin("Set a 4-digit PIN: ", pin1);
+        readPin("Confirm PIN: ", pin2);
+        if (strcmp(pin1, pin2) == 0) {
+            break;
+        }
+        printf("PINs do not match. Try again.\n");
+    }
+    snprintf(acc.pin, sizeof acc.pin, "%s", pin1);
+
+    /* generate a unique account number */
+    while (findAccount(bank->head, bank->nextAccNo) != NULL) {
+        bank->nextAccNo++;
+    }
+    acc.accNo = bank->nextAccNo++;
+    acc.balance = deposit;
+    acc.status = 1;
+
+    node = insertAccount(bank, &acc);
+    if (node == NULL) {
+        printf("Account could not be created.\n");
+        return;
+    }
+    pushTransaction(&bank->txStack, acc.accNo, "Account creation", deposit, acc.balance, 0);
+    saveAll(bank);
+    printf("\nAccount created successfully!\n");
+    printf("Your account number is: %d (please remember it)\n", acc.accNo);
+}
+
+/* Customer login: returns the account node if credentials are correct */
+static AccountNode *loginCustomer(Bank *bank)
+{
+    int attempt, accNo;
+    char pin[PIN_LEN];
+    AccountNode *node;
+
+    printf("\n--- Customer Login ---\n");
+    for (attempt = 1; attempt <= MAX_LOGIN_ATTEMPTS; attempt++) {
+        accNo = readInt("Account number: ", FIRST_ACC_NO, MAX_ACC_NO);
+        readPin("PIN: ", pin);
+        node = findAccount(bank->head, accNo);
+        if (node != NULL && strcmp(node->data.pin, pin) == 0) {
+            if (!node->data.status) {
+                printf("This account is blocked. Please contact the bank.\n");
+                return NULL;
+            }
+            printf("Login successful. Welcome, %s!\n", node->data.name);
+            return node;
+        }
+        printf("Wrong account number or PIN. (Attempt %d of %d)\n", attempt, MAX_LOGIN_ATTEMPTS);
+    }
+    printf("Too many failed attempts. Returning to main menu.\n");
+    return NULL;
+}
+
+static void checkBalance(const AccountNode *user)
+{
+    printf("\nAvailable balance: Rs %.2f\n", user->data.balance);
+}
+
+static void depositMoney(Bank *bank, AccountNode *user)
+{
+    double amount = readAmount("Amount to deposit: ");
+    user->data.balance += amount;
+    pushTransaction(&bank->txStack, user->data.accNo, "Deposit", amount, user->data.balance, 0);
+    saveAll(bank);
+    printf("Rs %.2f deposited. New balance: Rs %.2f\n", amount, user->data.balance);
+}
+
+static void withdrawMoney(Bank *bank, AccountNode *user)
+{
+    double amount = readAmount("Amount to withdraw: ");
+    if (amount > user->data.balance) {
+        printf("Insufficient balance. Available: Rs %.2f\n", user->data.balance);
+        return;
+    }
+    user->data.balance -= amount;
+    pushTransaction(&bank->txStack, user->data.accNo, "Withdrawal", amount, user->data.balance, 0);
+    saveAll(bank);
+    printf("Rs %.2f withdrawn. New balance: Rs %.2f\n", amount, user->data.balance);
+}
+
+/* Transfer from the logged-in (sender) account to another account */
+static void transferMoney(Bank *bank, AccountNode *sender)
+{
+    int receiverNo;
+    double amount;
+    AccountNode *receiver;
+
+    printf("\n--- Transfer Money ---\n");
+    printf("Sender account   : %d\n", sender->data.accNo);
+    receiverNo = readInt("Receiver account number: ", FIRST_ACC_NO, MAX_ACC_NO);
+
+    if (receiverNo == sender->data.accNo) {
+        printf("You cannot transfer money to your own account.\n");
+        return;
+    }
+    receiver = findAccount(bank->head, receiverNo);
+    if (receiver == NULL) {
+        printf("Receiver account does not exist. Transfer cancelled.\n");
+        return;
+    }
+    if (!receiver->data.status) {
+        printf("Receiver account is blocked. Transfer cancelled.\n");
+        return;
+    }
+    amount = readAmount("Amount to transfer: ");
+    if (amount > sender->data.balance) {
+        printf("Insufficient balance. Available: Rs %.2f\n", sender->data.balance);
+        return;
+    }
+
+    sender->data.balance -= amount;
+    receiver->data.balance += amount;
+    pushTransaction(&bank->txStack, sender->data.accNo, "Transfer Out", amount,
+                    sender->data.balance, receiverNo);
+    pushTransaction(&bank->txStack, receiver->data.accNo, "Transfer In", amount,
+                    receiver->data.balance, sender->data.accNo);
+    saveAll(bank);
+    printf("Rs %.2f transferred to account %d (%s).\n", amount, receiverNo, receiver->data.name);
+    printf("Your new balance: Rs %.2f\n", sender->data.balance);
+}
+
+static void changePin(Bank *bank, AccountNode *user)
+{
+    char oldPin[PIN_LEN], newPin1[PIN_LEN], newPin2[PIN_LEN];
+
+    readPin("Enter current PIN: ", oldPin);
+    if (strcmp(oldPin, user->data.pin) != 0) {
+        printf("Incorrect current PIN.\n");
+        return;
+    }
+    readPin("Enter new 4-digit PIN: ", newPin1);
+    readPin("Confirm new PIN: ", newPin2);
+    if (strcmp(newPin1, newPin2) != 0) {
+        printf("PINs do not match. PIN not changed.\n");
+        return;
+    }
+    snprintf(user->data.pin, sizeof user->data.pin, "%s", newPin1);
+    saveAll(bank);
+    printf("PIN changed successfully.\n");
+}
+
+/* Menu shown after a successful customer login */
+static void customerMenu(Bank *bank, AccountNode *user)
+{
+    int choice;
+    do {
+        printf("\n---------- CUSTOMER MENU ----------\n");
+        printf("Logged in: %s (Account %d)\n\n", user->data.name, user->data.accNo);
+        printf("1. Check Balance\n");
+        printf("2. Deposit Money\n");
+        printf("3. Withdraw Money\n");
+        printf("4. Transfer Money\n");
+        printf("5. Transaction History\n");
+        printf("6. Account Details\n");
+        printf("7. Change PIN\n");
+        printf("8. Logout\n");
+        choice = readInt("Enter choice: ", 1, 8);
+
+        switch (choice) {
+        case 1: checkBalance(user); break;
+        case 2: depositMoney(bank, user); break;
+        case 3: withdrawMoney(bank, user); break;
+        case 4: transferMoney(bank, user); break;
+        case 5:
+            printf("\n--- Transaction History (newest first) ---\n");
+            displayTransactions(&bank->txStack, user->data.accNo, 0);
+            break;
+        case 6: displayAccountDetails(&user->data); break;
+        case 7: changePin(bank, user); break;
+        case 8: printf("Logged out successfully.\n"); break;
+        }
+    } while (choice != 8);
+}
+
+/* ====================================================== */
+/*                    ADMIN OPERATIONS                     */
+/* ====================================================== */
+
+static int adminLogin(void)
+{
+    char user[INPUT_LEN], pass[INPUT_LEN];
+    int attempt;
+
+    printf("\n--- Admin Login ---\n");
+    for (attempt = 1; attempt <= MAX_LOGIN_ATTEMPTS; attempt++) {
+        readLine("Username: ", user, sizeof user);
+        readLine("Password: ", pass, sizeof pass);
+        if (strcmp(user, ADMIN_USER) == 0 && strcmp(pass, ADMIN_PASS) == 0) {
+            printf("Admin login successful.\n");
+            return 1;
+        }
+        printf("Wrong username or password. (Attempt %d of %d)\n", attempt, MAX_LOGIN_ATTEMPTS);
+    }
+    printf("Too many failed attempts. Returning to main menu.\n");
+    return 0;
+}
+
+static void deleteAccount(Bank *bank)
+{
+    int accNo;
+    AccountNode *node;
+
+    accNo = readInt("Account number to delete: ", FIRST_ACC_NO, MAX_ACC_NO);
+    node = findAccount(bank->head, accNo);
+    if (node == NULL) {
+        printf("Account %d not found.\n", accNo);
+        return;
+    }
+    printAccountHeader();
+    printAccountRow(&node->data);
+    if (!readYesNo("Are you sure you want to delete this account? (y/n): ")) {
+        printf("Deletion cancelled.\n");
+        return;
+    }
+    if (deleteAccountNode(bank, accNo)) {
+        saveAll(bank);
+        printf("Account %d deleted.\n", accNo);
+    }
+}
+
+static void updateAccount(Bank *bank)
+{
+    int accNo, choice;
+    AccountNode *node;
+
+    accNo = readInt("Account number to update: ", FIRST_ACC_NO, MAX_ACC_NO);
+    node = findAccount(bank->head, accNo);
+    if (node == NULL) {
+        printf("Account %d not found.\n", accNo);
+        return;
+    }
+    printf("\nUpdating account of %s\n", node->data.name);
+    printf("1. Change name\n2. Change phone number\n3. Change address\n");
+    printf("4. Block / Activate account\n5. Cancel\n");
+    choice = readInt("Enter choice: ", 1, 5);
+
+    switch (choice) {
+    case 1: readName("New name: ", node->data.name); break;
+    case 2: readPhone(node->data.phone); break;
+    case 3: readAddress(node->data.address); break;
+    case 4:
+        node->data.status = !node->data.status;
+        printf("Account is now %s.\n", node->data.status ? "Active" : "Blocked");
+        break;
+    default: return;
+    }
+    saveAll(bank);
+    printf("Account updated.\n");
+}
+
+/* Admin sorting menu */
+static void sortAccountsMenu(Bank *bank)
+{
+    int key, order;
+    const char *keyName[] = {"", "account number", "customer name", "balance"};
+
+    if (bank->head == NULL) {
+        printf("No accounts to sort.\n");
+        return;
+    }
+    printf("\n--- Sort Accounts ---\n");
+    printf("1. By account number\n2. By customer name\n3. By balance\n");
+    key = readInt("Sort by: ", 1, 3);
+    printf("1. Ascending\n2. Descending\n");
+    order = readInt("Order: ", 1, 2);
+
+    if (sortAccounts(bank, key, order == 1)) {
+        printf("\nAccounts sorted by %s (%s) using Bubble Sort:\n",
+               keyName[key], order == 1 ? "ascending" : "descending");
+        displayAccounts(bank);
+        printf("[Bubble Sort time complexity: O(n^2) worst/average, O(n) best case]\n");
+        saveAccounts(bank);
+    }
+}
+
+static void manageQueue(Bank *bank)
+{
+    int choice, service;
+    char name[NAME_LEN];
+    const char *services[] = {"", "Cash Deposit", "Cash Withdrawal", "Account Opening", "General Enquiry"};
+
+    do {
+        printf("\n--- Customer Queue (FIFO) ---\n");
+        printf("1. Add customer to queue\n2. Serve next customer\n");
+        printf("3. Display waiting queue\n4. Back\n");
+        choice = readInt("Enter choice: ", 1, 4);
+        if (choice == 1) {
+            readName("Customer name: ", name);
+            printf("Service: 1. Cash Deposit  2. Cash Withdrawal  3. Account Opening  4. General Enquiry\n");
+            service = readInt("Enter choice: ", 1, 4);
+            addToQueue(&bank->queue, name, services[service]);
+        } else if (choice == 2) {
+            serveQueue(&bank->queue);
+        } else if (choice == 3) {
+            displayQueue(&bank->queue);
+        }
+    } while (choice != 4);
+}
+
+/* Bank statistics calculated from the stored accounts */
+static void bankStatistics(const Bank *bank)
+{
+    const AccountNode *cur, *highest = NULL, *lowest = NULL;
+    int total = 0, savings = 0, current = 0;
+    double sum = 0.0;
+
+    for (cur = bank->head; cur != NULL; cur = cur->next) {
+        total++;
+        sum += cur->data.balance;
+        if (strcmp(cur->data.type, TYPE_SAVINGS) == 0) {
+            savings++;
+        } else {
+            current++;
+        }
+        if (highest == NULL || cur->data.balance > highest->data.balance) {
+            highest = cur;
+        }
+        if (lowest == NULL || cur->data.balance < lowest->data.balance) {
+            lowest = cur;
+        }
+    }
+
+    printf("\n----------- BANK STATISTICS -----------\n");
+    printf("Total number of accounts : %d\n", total);
+    printf("Total bank balance       : Rs %.2f\n", sum);
+    printf("Savings accounts         : %d\n", savings);
+    printf("Current accounts         : %d\n", current);
+    if (total > 0) {
+        printf("Highest balance          : Rs %.2f (Acc %d, %s)\n",
+               highest->data.balance, highest->data.accNo, highest->data.name);
+        printf("Lowest balance           : Rs %.2f (Acc %d, %s)\n",
+               lowest->data.balance, lowest->data.accNo, lowest->data.name);
+    } else {
+        printf("Highest / lowest balance : N/A (no accounts)\n");
+    }
+}
+
+static void adminMenu(Bank *bank)
+{
+    int choice;
+    do {
+        printf("\n---------- ADMIN MENU ----------\n");
+        printf("1. Display All Accounts\n");
+        printf("2. Search Account\n");
+        printf("3. Delete Account\n");
+        printf("4. Update Account\n");
+        printf("5. Sort Accounts\n");
+        printf("6. View All Transactions\n");
+        printf("7. Manage Customer Queue\n");
+        printf("8. Bank Statistics\n");
+        printf("9. Logout\n");
+        choice = readInt("Enter choice: ", 1, 9);
+
+        switch (choice) {
+        case 1: displayAccounts(bank); break;
+        case 2: searchAccount(bank); break;
+        case 3: deleteAccount(bank); break;
+        case 4: updateAccount(bank); break;
+        case 5: sortAccountsMenu(bank); break;
+        case 6:
+            printf("\n--- All Transactions (newest first) ---\n");
+            displayTransactions(&bank->txStack, 0, 0);
+            break;
+        case 7: manageQueue(bank); break;
+        case 8: bankStatistics(bank); break;
+        case 9: printf("Admin logged out.\n"); break;
+        }
+    } while (choice != 9);
+}
+
+/* ====================================================== */
+/*                   DSA DEMONSTRATION                     */
+/* ====================================================== */
+
+static void dsaDemonstration(Bank *bank)
+{
+    int choice;
+    Transaction t;
+
+    do {
+        printf("\n---------- DSA DEMONSTRATION ----------\n");
+        printf("1. Linked List - Display accounts\n");
+        printf("2. Queue       - Display waiting customers\n");
+        printf("3. Stack       - Display recent transactions\n");
+        printf("4. Searching   - Search account\n");
+        printf("5. Sorting     - Sort accounts by balance\n");
+        printf("6. Back\n");
+        choice = readInt("Enter choice: ", 1, 6);
+
+        switch (choice) {
+        case 1:
+            printf("\nLinked list: each account is a node pointing to the next one.\n");
+            displayAccounts(bank);
+            break;
+        case 2:
+            printf("\nQueue (FIFO): the customer who arrived first is served first.\n");
+            displayQueue(&bank->queue);
+            break;
+        case 3:
+            printf("\nStack (LIFO): the newest transaction is on top. Last 5 transactions:\n");
+            displayTransactions(&bank->txStack, 0, 5);
+            if (popTransaction(&bank->txStack, &t)) {
+                printf("\nPOP  -> removed top: Transaction %d (%s, Rs %.2f)\n", t.id, t.type, t.amount);
+                pushTransactionRecord(&bank->txStack, &t);
+                printf("PUSH -> put it back on top (history is unchanged).\n");
+            }
+            break;
+        case 4:
+            searchAccount(bank);
+            break;
+        case 5:
+            if (sortAccounts(bank, SORT_BY_BALANCE, 1)) {
+                printf("\nAccounts sorted by balance (ascending) using Bubble Sort:\n");
+                displayAccounts(bank);
+                saveAccounts(bank);
+            } else {
+                printf("No accounts to sort.\n");
+            }
+            break;
+        }
+    } while (choice != 6);
+}
+
+/* ====================================================== */
+/*                          MAIN                           */
+/* ====================================================== */
+
+static void initBank(Bank *bank)
+{
+    bank->head = NULL;
+    bank->txStack.top = NULL;
+    bank->txStack.count = 0;
+    bank->txStack.nextId = 1;
+    bank->queue.front = NULL;
+    bank->queue.rear = NULL;
+    bank->queue.size = 0;
+    bank->queue.nextToken = 1;
+    bank->nextAccNo = FIRST_ACC_NO;
+}
+
+int main(void)
+{
+    Bank bank;
+    AccountNode *user;
+    int choice;
+
+    initBank(&bank);
+    loadAccounts(&bank);
+    loadTransactions(&bank.txStack);
+
+    do {
+        printf("\n========================================\n");
+        printf("        BANKING MANAGEMENT SYSTEM\n");
+        printf("========================================\n");
+        printf("1. Customer Login\n");
+        printf("2. Create Account\n");
+        printf("3. Admin Login\n");
+        printf("4. DSA Demonstration\n");
+        printf("5. Exit\n");
+        choice = readInt("Enter choice: ", 1, 5);
+
+        switch (choice) {
+        case 1:
+            user = loginCustomer(&bank);
+            if (user != NULL) {
+                customerMenu(&bank, user);
+            }
+            break;
+        case 2:
+            createAccount(&bank);
+            break;
+        case 3:
+            if (adminLogin()) {
+                adminMenu(&bank);
+            }
+            break;
+        case 4:
+            dsaDemonstration(&bank);
+            break;
+        case 5:
+            printf("\nSaving data... Thank you for using the Banking Management System.\n");
+            break;
+        }
+    } while (choice != 5);
+
+    /* save everything and free all dynamically allocated memory */
+    saveAll(&bank);
+    freeAccounts(&bank);
+    freeStack(&bank.txStack);
+    freeQueue(&bank.queue);
+    return 0;
+}
